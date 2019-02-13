@@ -1,0 +1,166 @@
+From 5b95101eb7a1379af6b5829ad424934ced0495f5 Mon Sep 17 00:00:00 2001
+From: Eddie James <eajames@linux.ibm.com>
+Date: Fri, 29 Mar 2019 17:37:59 -0500
+Subject: [PATCH 8/8] test
+
+Signed-off-by: Eddie James <eajames@linux.ibm.com>
+---
+ drivers/misc/aspeed-xdma.c | 53 +++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 38 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/misc/aspeed-xdma.c b/drivers/misc/aspeed-xdma.c
+index a645a5f..938bbb6 100644
+--- a/drivers/misc/aspeed-xdma.c
++++ b/drivers/misc/aspeed-xdma.c
+@@ -74,6 +74,11 @@
+ #define XDMA_CMD_CONF_NUM_LINES		GENMASK(27, 16)
+ #define XDMA_CMD_CONF_IRQ		BIT(31)
+ 
++#define XDMA_CMD_ID_UPDIR		GENMASK(17, 16)
++#define  XDMA_CMD_ID_UPDIR_BMC		0
++#define  XDMA_CMD_ID_UPDIR_HOST		1
++#define  XDMA_CMD_ID_UPDIR_VGA		2
++
+ #define XDMA_DS_PCIE_REQ_SIZE_128	0
+ #define XDMA_DS_PCIE_REQ_SIZE_256	1
+ #define XDMA_DS_PCIE_REQ_SIZE_512	2
+@@ -158,6 +163,15 @@ struct aspeed_xdma_client {
+ 	u32 size;
+ };
+ 
++static const u32 aspeed_xdma_bmc_pcie_conf = SCU_PCIE_CONF_BMC_EN |
++		SCU_PCIE_CONF_BMC_EN_MSI | SCU_PCIE_CONF_BMC_EN_MCTP |
++		SCU_PCIE_CONF_BMC_EN_IRQ | SCU_PCIE_CONF_BMC_EN_DMA |
++		SCU_PCIE_CONF_RSVD;
++static const u32 aspeed_xdma_vga_pcie_conf = SCU_PCIE_CONF_VGA_EN |
++		SCU_PCIE_CONF_VGA_EN_MSI | SCU_PCIE_CONF_VGA_EN_MCTP |
++		SCU_PCIE_CONF_VGA_EN_IRQ | SCU_PCIE_CONF_VGA_EN_DMA |
++		SCU_PCIE_CONF_RSVD;
++
+ static u32 aspeed_xdma_reg_read(struct aspeed_xdma *ctx, u32 reg)
+ {
+ 	u32 v = readl(ctx->base + reg);
+@@ -172,6 +186,15 @@ static void aspeed_xdma_reg_write(struct aspeed_xdma *ctx, u32 reg, u32 val)
+ 	dev_dbg(ctx->dev, "write %02x[%08x]\n", reg, readl(ctx->base + reg));
+ }
+ 
++static void aspeed_scu_pcie_write(struct aspeed_xdma *ctx, u32 conf)
++{
++	u32 v = 0;
++
++	regmap_write(ctx->scu, SCU_PCIE_CONF, conf);
++	regmap_read(ctx->scu, SCU_PCIE_CONF, &v);
++	dev_dbg(ctx->dev, "write scu pcie_conf[%08x]\n", v);
++}
++
+ static void aspeed_xdma_init_eng(struct aspeed_xdma *ctx)
+ {
+ 	const u32 ctrl = XDMA_CTRL_US_COMP | XDMA_CTRL_DS_COMP |
+@@ -213,6 +236,7 @@ static void aspeed_xdma_start(struct aspeed_xdma *ctx,
+ 	unsigned int line_size = op->len / XDMA_BYTE_ALIGN;
+ 	unsigned int num_lines = 1;
+ 	unsigned int nidx = (ctx->cmd_idx + 1) % XDMA_NUM_CMDS;
++	unsigned int pitch = 1;
+ 	struct aspeed_xdma_cmd *cmd =
+ 		&(((struct aspeed_xdma_cmd *)ctx->cmdq)[ctx->cmd_idx]);
+ 
+@@ -224,6 +248,7 @@ static void aspeed_xdma_start(struct aspeed_xdma *ctx,
+ 		total = XDMA_MAX_LINE_SIZE * num_lines;
+ 		rem = line_size - total;
+ 		line_size = XDMA_MAX_LINE_SIZE;
++		pitch = line_size;
+ 
+ 		if (rem) {
+ 			unsigned int offs = total * XDMA_BYTE_ALIGN;
+@@ -244,6 +269,8 @@ static void aspeed_xdma_start(struct aspeed_xdma *ctx,
+ 			r_cmd->comm1_hi =
+ 				FIELD_PREP(XDMA_CMD_COMM1_HI_HOST_PITCH, 1) |
+ 				FIELD_PREP(XDMA_CMD_COMM1_HI_BMC_PITCH, 1);
++			r_cmd->id = FIELD_PREP(XDMA_CMD_ID_UPDIR,
++					       XDMA_CMD_ID_UPDIR_HOST);
+ 
+ 			/* do not trigger IRQ for first command */
+ 			conf = XDMA_CMD_CONF_CHECK;
+@@ -266,8 +293,9 @@ static void aspeed_xdma_start(struct aspeed_xdma *ctx,
+ 	cmd->conf = conf |
+ 		FIELD_PREP(XDMA_CMD_CONF_LINE_SIZE, line_size) |
+ 		FIELD_PREP(XDMA_CMD_CONF_NUM_LINES, num_lines);
+-	cmd->comm1_hi = FIELD_PREP(XDMA_CMD_COMM1_HI_HOST_PITCH, line_size) |
+-			FIELD_PREP(XDMA_CMD_COMM1_HI_BMC_PITCH, line_size);
++	cmd->comm1_hi = FIELD_PREP(XDMA_CMD_COMM1_HI_HOST_PITCH, pitch) |
++			FIELD_PREP(XDMA_CMD_COMM1_HI_BMC_PITCH, pitch);
++	cmd->id = FIELD_PREP(XDMA_CMD_ID_UPDIR, XDMA_CMD_ID_UPDIR_HOST);
+ 
+ 	memcpy(ctx->vga_virt, ctx->cmdq, XDMA_CMDQ_SIZE);
+ 
+@@ -574,17 +602,12 @@ static int aspeed_xdma_init_mem(struct aspeed_xdma *ctx)
+ 	int rc;
+ 	u32 scu_conf = 0;
+ 	u32 mem_size = 0x20000000;
+-	const u32 pcie_conf = SCU_PCIE_CONF_VGA_EN | SCU_PCIE_CONF_VGA_EN_MSI |
+-		SCU_PCIE_CONF_VGA_EN_MCTP | SCU_PCIE_CONF_VGA_EN_IRQ |
+-		SCU_PCIE_CONF_VGA_EN_DMA | SCU_PCIE_CONF_BMC_EN_MSI |
+-		SCU_PCIE_CONF_BMC_EN_MCTP | SCU_PCIE_CONF_BMC_EN_IRQ |
+-		SCU_PCIE_CONF_BMC_EN_DMA | SCU_PCIE_CONF_RSVD;
+ 	const u32 mem_sizes[4] = { 0x8000000, 0x10000000, 0x20000000,
+ 				   0x40000000 };
+ 	const u32 vga_sizes[4] = { 0x800000, 0x1000000, 0x2000000, 0x4000000 };
+ 	void __iomem *sdmc_base = ioremap(0x1e6e0000, 0x100);
+ 
+-	regmap_write(ctx->scu, SCU_PCIE_CONF, pcie_conf);
++	aspeed_scu_pcie_write(ctx, aspeed_xdma_vga_pcie_conf);
+ 
+ 	regmap_read(ctx->scu, SCU_STRAP, &scu_conf);
+ 	ctx->vga_size = vga_sizes[FIELD_GET(SCU_STRAP_VGA_MEM, scu_conf)];
+@@ -616,7 +639,8 @@ static int aspeed_xdma_init_mem(struct aspeed_xdma *ctx)
+ 	}
+ 
+ 	rc = dma_declare_coherent_memory(ctx->dev, ctx->vga_phys,
+-					 ctx->vga_phys, ctx->vga_size);
++					 ctx->vga_phys, ctx->vga_size,
++					 DMA_MEMORY_EXCLUSIVE);
+ 	if (rc) {
+ 		dev_err(ctx->dev, "Failed to declare coherent memory: %d.\n",
+ 			rc);
+@@ -737,7 +761,7 @@ static void aspeed_xdma_free_vga_blks(struct aspeed_xdma *ctx)
+ 	}
+ }
+ 
+-static int aspeed_xdma_change_pcie_conf(struct aspeed_xdma *ctx, u32 val)
++static int aspeed_xdma_change_pcie_conf(struct aspeed_xdma *ctx, u32 conf)
+ {
+ 	int rc;
+ 
+@@ -758,9 +782,8 @@ static int aspeed_xdma_change_pcie_conf(struct aspeed_xdma *ctx, u32 val)
+ 	reset_control_assert(ctx->reset);
+ 	msleep(10);
+ 
+-	regmap_update_bits(ctx->scu, SCU_PCIE_CONF,
+-			   SCU_PCIE_CONF_VGA_EN | SCU_PCIE_CONF_BMC_EN,
+-			   val);
++	aspeed_scu_pcie_write(ctx, conf);
++
+ 	msleep(10);
+ 
+ 	reset_control_deassert(ctx->reset);
+@@ -780,7 +803,7 @@ static ssize_t aspeed_xdma_use_bmc(struct device *dev,
+ 	int rc;
+ 	struct aspeed_xdma *ctx = dev_get_drvdata(dev);
+ 
+-	rc = aspeed_xdma_change_pcie_conf(ctx, SCU_PCIE_CONF_BMC_EN);
++	rc = aspeed_xdma_change_pcie_conf(ctx, aspeed_xdma_bmc_pcie_conf);
+ 	return rc ?: count;
+ }
+ static DEVICE_ATTR(use_bmc, 0200, NULL, aspeed_xdma_use_bmc);
+@@ -792,7 +815,7 @@ static ssize_t aspeed_xdma_use_vga(struct device *dev,
+ 	int rc;
+ 	struct aspeed_xdma *ctx = dev_get_drvdata(dev);
+ 
+-	rc = aspeed_xdma_change_pcie_conf(ctx, SCU_PCIE_CONF_VGA_EN);
++	rc = aspeed_xdma_change_pcie_conf(ctx, aspeed_xdma_vga_pcie_conf);
+ 	return rc ?: count;
+ }
+ static DEVICE_ATTR(use_vga, 0200, NULL, aspeed_xdma_use_vga);
+-- 
+1.8.3.1
+

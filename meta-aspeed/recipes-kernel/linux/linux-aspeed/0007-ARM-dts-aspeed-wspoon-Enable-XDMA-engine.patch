@@ -1,0 +1,28 @@
+From 6cc7cfd1d8ad915ad9089d2172897aa38742e04e Mon Sep 17 00:00:00 2001
+From: Eddie James <eajames@linux.vnet.ibm.com>
+Date: Mon, 4 Mar 2019 12:53:07 -0600
+Subject: [PATCH 7/8] ARM: dts: aspeed: wspoon: Enable XDMA engine
+
+Enable the XDMA engine node.
+
+Signed-off-by: Eddie James <eajames@linux.vnet.ibm.com>
+---
+ arch/arm/boot/dts/aspeed-bmc-opp-witherspoon.dts | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/arm/boot/dts/aspeed-bmc-opp-witherspoon.dts b/arch/arm/boot/dts/aspeed-bmc-opp-witherspoon.dts
+index 1cdc96d..30bad1a 100644
+--- a/arch/arm/boot/dts/aspeed-bmc-opp-witherspoon.dts
++++ b/arch/arm/boot/dts/aspeed-bmc-opp-witherspoon.dts
+@@ -664,4 +664,8 @@
+ 	status = "okay";
+ };
+ 
++&xdma {
++	status = "okay";
++};
++
+ #include "ibm-power9-dual.dtsi"
+-- 
+1.8.3.1
+

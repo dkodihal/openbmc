@@ -9,7 +9,7 @@ After=phosphor-ipmi-host.service
 
 [Service]
 Restart=always
-ExecStart=/usr/bin/env mboxd --flash {FLASH_SIZE} --window-size 1M
+ExecStart=/usr/bin/env mboxd --flash {FLASH_SIZE} --window-size 1M --window-num 63
 SyslogIdentifier=mboxd
 
 [Install]

@@ -1,0 +1,87 @@
+From c2836bb47978ea80afcc0040facf7e2b3a58f6b3 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Fri, 17 May 2019 09:51:07 +0930
+Subject: [PATCH] mctp-lpc: Retry writing ODR if OBF is not set
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ drivers/misc/mctp-lpc.c | 30 +++++++++++++++++++++++-------
+ 1 file changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/misc/mctp-lpc.c b/drivers/misc/mctp-lpc.c
+index 7346807a688e..1edf7bf3cd85 100644
+--- a/drivers/misc/mctp-lpc.c
++++ b/drivers/misc/mctp-lpc.c
+@@ -142,7 +142,7 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+ 
+ 		priv->pending = false;
+ 		/* Re-enable IRQs */
+-		dev_dbg(dev, "Consumed IDR, unmasking IRQ\n");
++		dev_dbg(dev, "IDR=0x%x, unmasking IRQ\n", idr);
+ 		regmap_update_bits(priv->map, LPC_HICRB, LPC_HICRB_IBFIF4,
+ 				   LPC_HICRB_IBFIF4);
+ 
+@@ -200,7 +200,7 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 	struct mctp_lpc *priv;
+ 	struct device *dev;
+ 	size_t remaining;
+-	unsigned int str;
++	unsigned int val;
+ 
+ 	priv = to_mctp_lpc(filp);
+ 	dev = priv->miscdev.this_device;
+@@ -223,21 +223,36 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 	remaining = count;
+ 
+ 	if (*ppos == 0) {
++#define ODR_OBF_RETRY_ATTEMPTS 5
++		int retry = ODR_OBF_RETRY_ATTEMPTS;
++
+ 		/* Wait until OBF is clear - we don't get an IRQ */
+ 		dev_dbg(dev, "Waiting for OBF to clear\n");
+ 		for (;;) {
+ 			if (signal_pending(current))
+ 				return -EINTR;
+ 
+-			regmap_read(priv->map, LPC_STR4, &str);
+-			if (!(str & STR4_OBF))
++			regmap_read(priv->map, LPC_STR4, &val);
++			if (!(val & STR4_OBF))
+ 				break;
+ 
+ 			msleep(1);
+ 		}
+ 
+ 		dev_dbg(dev, "Writing 0x%x to ODR\n", *data);
+-		regmap_write(priv->map, LPC_ODR4, *data);
++
++		do {
++			regmap_write(priv->map, LPC_ODR4, *data);
++			regmap_read(priv->map, LPC_STR4, &val);
++			if (val & STR4_OBF)
++				break;
++			dev_dbg(dev, "Write to ODR failed to set OBF, retrying\n");
++		} while (--retry);
++
++		if (!retry)
++			dev_err(dev, "Failed to set OBF after %d attempts, expect protocol failures\n",
++				ODR_OBF_RETRY_ATTEMPTS);
++
+ 		remaining--;
+ 		data++;
+ 	}
+@@ -253,8 +268,9 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 
+ 	WARN_ON(remaining);
+ 
+-	regmap_read(priv->map, LPC_STR4, &str);
+-	dev_dbg(dev, "Triggering SerIRQ (current str=0x%x)\n", str);
++	regmap_read(priv->map, LPC_STR4, &val);
++	dev_dbg(dev, "Triggering SerIRQ (current STR=0x%x)\n", val);
++
+ 	/* Trigger Host IRQ */
+ 	regmap_update_bits(priv->map, LPC_HICRC, LPC_KCS4_IRQ_HOST,
+ 			   LPC_KCS4_IRQ_HOST);
+-- 
+2.20.1
+

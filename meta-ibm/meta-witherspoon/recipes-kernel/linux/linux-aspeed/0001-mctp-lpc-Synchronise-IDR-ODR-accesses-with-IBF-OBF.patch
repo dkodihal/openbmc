@@ -1,0 +1,79 @@
+From 899fecb5a538f06e1314fd0a7480b47479446ed9 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Mon, 20 May 2019 16:38:45 +0930
+Subject: [PATCH] mctp-lpc: Synchronise IDR/ODR accesses with IBF/OBF
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ drivers/misc/mctp-lpc.c | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/misc/mctp-lpc.c b/drivers/misc/mctp-lpc.c
+index 1edf7bf3cd85..d59063460e6b 100644
+--- a/drivers/misc/mctp-lpc.c
++++ b/drivers/misc/mctp-lpc.c
+@@ -45,6 +45,7 @@
+ #define HOST_SERIRQ_TYPE     LPC_KCS4_IRQTYPE_LOW
+ 
+ #define RX_BUF_SIZE 1024
++#define STR4_RETRY_ATTEMPTS 5
+ 
+ struct mctp_lpc {
+ 	struct miscdevice miscdev;
+@@ -118,6 +119,7 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+ 
+ 	spin_lock_irq(&priv->rx.lock);
+ 	if (*ppos == 0) {
++		int retry = STR4_RETRY_ATTEMPTS;
+ 		unsigned int val;
+ 		u8 str;
+ 		u8 idr;
+@@ -140,6 +142,14 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+ 		regmap_read(priv->map, LPC_IDR4, &val);
+ 		idr = val & 0xff;
+ 
++		/* Synchronise with IBF, but account for genuine IBF by limiting retries */
++		do {
++			regmap_read(priv->map, LPC_STR4, &val);
++			if (!(val & STR4_IBF))
++				break;
++			dev_dbg(dev, "Waiting for IBF to become clear");
++		} while (--retry);
++
+ 		priv->pending = false;
+ 		/* Re-enable IRQs */
+ 		dev_dbg(dev, "IDR=0x%x, unmasking IRQ\n", idr);
+@@ -223,8 +233,7 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 	remaining = count;
+ 
+ 	if (*ppos == 0) {
+-#define ODR_OBF_RETRY_ATTEMPTS 5
+-		int retry = ODR_OBF_RETRY_ATTEMPTS;
++		int retry = STR4_RETRY_ATTEMPTS;
+ 
+ 		/* Wait until OBF is clear - we don't get an IRQ */
+ 		dev_dbg(dev, "Waiting for OBF to clear\n");
+@@ -241,17 +250,17 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 
+ 		dev_dbg(dev, "Writing 0x%x to ODR\n", *data);
+ 
++		regmap_write(priv->map, LPC_ODR4, *data);
+ 		do {
+-			regmap_write(priv->map, LPC_ODR4, *data);
+ 			regmap_read(priv->map, LPC_STR4, &val);
+ 			if (val & STR4_OBF)
+ 				break;
+-			dev_dbg(dev, "Write to ODR failed to set OBF, retrying\n");
++			dev_dbg(dev, "Waiting for OBF to become set");
+ 		} while (--retry);
+ 
+ 		if (!retry)
+ 			dev_err(dev, "Failed to set OBF after %d attempts, expect protocol failures\n",
+-				ODR_OBF_RETRY_ATTEMPTS);
++				STR4_RETRY_ATTEMPTS);
+ 
+ 		remaining--;
+ 		data++;
+-- 
+2.20.1
+

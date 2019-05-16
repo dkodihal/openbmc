@@ -1,17 +1,17 @@
-From 30ff2398bec0886fc191632da1fadf569b7de938 Mon Sep 17 00:00:00 2001
+From 737b8a51395462f387c475b53660344daefbd89d Mon Sep 17 00:00:00 2001
 From: Andrew Jeffery <andrew@aj.id.au>
 Date: Mon, 13 May 2019 15:58:15 +0930
-Subject: [PATCH] mctp-lpc: Leave value in IDR and disable IRQ on IRQ
+Subject: [PATCH 3/3] mctp-lpc: Leave value in IDR and disable IRQ on IRQ
 
 Re-enable the IRQ when userspace reads the value out.
 
 Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
 ---
- drivers/misc/mctp-lpc.c | 118 +++++++++++++++++++++-------------------
- 1 file changed, 63 insertions(+), 55 deletions(-)
+ drivers/misc/mctp-lpc.c | 181 ++++++++++++++++++++++++++--------------
+ 1 file changed, 119 insertions(+), 62 deletions(-)
 
 diff --git a/drivers/misc/mctp-lpc.c b/drivers/misc/mctp-lpc.c
-index cfa5f99ffa58..cf2ee0d2a62c 100644
+index cfa5f99ffa58..7346807a688e 100644
 --- a/drivers/misc/mctp-lpc.c
 +++ b/drivers/misc/mctp-lpc.c
 @@ -18,11 +18,6 @@
@@ -49,7 +49,7 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
  #define RX_BUF_SIZE 1024
  
  struct mctp_lpc {
-@@ -47,40 +51,36 @@ struct mctp_lpc {
+@@ -47,40 +51,45 @@ struct mctp_lpc {
  	struct regmap *map;
  
  	wait_queue_head_t rx;
@@ -64,18 +64,37 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
  	unsigned long flags;
 -	unsigned int idr;
 +	unsigned int hicrb;
++	struct device *dev;
  	unsigned int str;
 +	irqreturn_t ret;
++
++	dev = priv->miscdev.this_device;
  
  	spin_lock_irqsave(&priv->rx.lock, flags);
  
  	regmap_read(priv->map, LPC_STR4, &str);
--
++	regmap_read(priv->map, LPC_HICRB, &hicrb);
+ 
 -	if (!(str & STR4_IBF)) {
 -		spin_unlock_irqrestore(&priv->rx.lock, flags);
 -		return IRQ_NONE;
--	}
--
++	if ((str & STR4_IBF) && (hicrb & LPC_HICRB_IBFIF4)) {
++		if (priv->pending)
++			dev_err(dev, "Storm brewing!");
++		dev_dbg(dev, "Received IRQ %d, masking to provide back-pressure\n",
++			irq);
++		/* Mask the IRQ / Enter polling mode */
++		regmap_update_bits(priv->map, LPC_HICRB, LPC_HICRB_IBFIF4, 0);
++		priv->pending = true;
++		dev_dbg(dev, "Set pending, waking waiters\n");
++		wake_up_locked(&priv->rx);
++		ret = IRQ_HANDLED;
++	} else {
++		dev_dbg(dev, "LPC IRQ triggered, but not for us (str=0x%x, hicrb=0x%x)\n",
++			str, hicrb);
++		ret = IRQ_NONE;
+ 	}
+ 
 -	if (priv->str & STR4_IBF)
 -		dev_err(priv->miscdev.parent,
 -			"Buffer overrun: dropping idr=0x%x\n", priv->idr);
@@ -86,19 +105,7 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
 -	priv->str = str & 0xff;
 -
 -	wake_up_locked(&priv->rx);
-+	regmap_read(priv->map, LPC_HICRB, &hicrb);
-+
-+	if ((str & STR4_IBF) && (hicrb & LPC_HICRB_IBFIF4)) {
-+		if (priv->pending)
-+			dev_err(priv->miscdev.this_device, "Storm brewing!");
-+		/* Mask the IRQ / Enter polling mode */
-+		regmap_update_bits(priv->map, LPC_HICRB, LPC_HICRB_IBFIF4, 0);
-+		priv->pending = true;
-+		wake_up_locked(&priv->rx);
-+		ret = IRQ_HANDLED;
-+	} else
-+		ret = IRQ_NONE;
- 
+-
  	spin_unlock_irqrestore(&priv->rx.lock, flags);
  
 -	return IRQ_HANDLED;
@@ -106,29 +113,53 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
  }
  
  static inline struct mctp_lpc *to_mctp_lpc(struct file *filp)
-@@ -105,8 +105,11 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+@@ -91,10 +100,14 @@ static inline struct mctp_lpc *to_mctp_lpc(struct file *filp)
+ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+ 			     size_t count, loff_t *ppos)
+ {
+-	struct mctp_lpc *priv = to_mctp_lpc(filp);
++	struct mctp_lpc *priv;
++	struct device *dev;
+ 	size_t remaining;
+ 	ssize_t rc;
+ 
++	priv = to_mctp_lpc(filp);
++	dev = priv->miscdev.this_device;
++
+ 	if (!count)
+ 		return 0;
+ 
+@@ -105,17 +118,35 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
  
  	spin_lock_irq(&priv->rx.lock);
  	if (*ppos == 0) {
 +		unsigned int val;
++		u8 str;
 +		u8 idr;
 +
  		/* YOLO blocking, non-block not supported */
 -		rc = wait_event_interruptible_locked(priv->rx, (priv->str & STR4_IBF));
-+		rc = wait_event_interruptible_locked(priv->rx, priv->pending);
++		dev_dbg(dev, "Waiting for IBF\n");
++		regmap_read(priv->map, LPC_STR4, &val);
++		str = val & 0xff;
++		rc = wait_event_interruptible_locked(priv->rx, (priv->pending || str & STR4_IBF));
  		if (rc < 0)
  			goto out;
  
-@@ -115,7 +118,15 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+ 		if (signal_pending(current)) {
++			dev_dbg(dev, "Interrupted waiting for IBF\n");
+ 			rc = -EINTR;
  			goto out;
  		}
  
 -		if (copy_to_user(buf, &priv->idr, sizeof(priv->idr))) {
++		dev_dbg(dev, "Woken by IBF IRQ, consuming IDR\n");
 +		regmap_read(priv->map, LPC_IDR4, &val);
 +		idr = val & 0xff;
 +
 +		priv->pending = false;
 +		/* Re-enable IRQs */
++		dev_dbg(dev, "Consumed IDR, unmasking IRQ\n");
 +		regmap_update_bits(priv->map, LPC_HICRB, LPC_HICRB_IBFIF4,
 +				   LPC_HICRB_IBFIF4);
 +
@@ -136,7 +167,7 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
  			rc = -EFAULT;
  			goto out;
  		}
-@@ -131,14 +142,10 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+@@ -131,15 +162,19 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
  		 * 2. (count == 2 && *ppos == 0)
  		 */
  		unsigned int val;
@@ -151,10 +182,19 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
 -		}
 +		regmap_read(priv->map, LPC_STR4, &val);
 +		str = val & 0xff;
++		if (*ppos == 0)
++			/*
++			 * If we got this far with `*ppos == 0` then we've read
++			 * data out of IDR, so set IBF when reporting back to
++			 * userspace so userspace knows the IDR value is valid.
++			 */
++			str |= STR4_IBF;
  
++		dev_dbg(dev, "Read status 0x%x\n", str);
  		if (copy_to_user(buf, &str, sizeof(str))) {
  			rc = -EFAULT;
-@@ -148,9 +155,6 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+ 			goto out;
+@@ -148,9 +183,6 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
  		remaining--;
  	}
  
@@ -164,7 +204,7 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
  	WARN_ON(remaining);
  
  	rc = count;
-@@ -164,11 +168,15 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+@@ -164,11 +196,15 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
  static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
  			      size_t count, loff_t *ppos)
  {
@@ -181,7 +221,7 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
  	if (!count)
  		return count;
  
-@@ -178,6 +186,9 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+@@ -178,6 +214,9 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
  	if (*ppos >= 2)
  		return -EINVAL;
  
@@ -191,9 +231,11 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
  	if (copy_from_user(data, buf, count))
  		return -EFAULT;
  
-@@ -186,36 +197,33 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+@@ -185,37 +224,37 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 
  	if (*ppos == 0) {
  		/* Wait until OBF is clear - we don't get an IRQ */
++		dev_dbg(dev, "Waiting for OBF to clear\n");
  		for (;;) {
 -			regmap_read(priv->map, LPC_STR4, &str);
 -			if (!(str & STR4_OBF)) {
@@ -213,6 +255,7 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
  			msleep(1);
  		}
 +
++		dev_dbg(dev, "Writing 0x%x to ODR\n", *data);
 +		regmap_write(priv->map, LPC_ODR4, *data);
 +		remaining--;
 +		data++;
@@ -226,6 +269,7 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
 +		if (!(*data & STR4_OBF))
 +			dev_err(dev, "Clearing OBF with status write: 0x%x\n",
 +				*data);
++		dev_dbg(dev, "Writing status 0x%x\n", *data);
  		regmap_write(priv->map, LPC_STR4, *data);
 -		spin_unlock_irq(&priv->rx.lock);
  		remaining--;
@@ -236,28 +280,64 @@ index cfa5f99ffa58..cf2ee0d2a62c 100644
  	regmap_read(priv->map, LPC_STR4, &str);
 -	printk("%s:%s:%d: Triggering SerIRQ. STR: 0x%x\n", __FILE__,
 -	       __func__, __LINE__, str);
-+	dev_dbg(dev, "Triggering SerIRQ. STR: 0x%x\n", str);
++	dev_dbg(dev, "Triggering SerIRQ (current str=0x%x)\n", str);
  	/* Trigger Host IRQ */
  	regmap_update_bits(priv->map, LPC_HICRC, LPC_KCS4_IRQ_HOST,
  			   LPC_KCS4_IRQ_HOST);
-@@ -229,7 +237,7 @@ static __poll_t mctp_lpc_poll(struct file *filp, poll_table *wait)
+@@ -225,25 +264,43 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 
+ static __poll_t mctp_lpc_poll(struct file *filp, poll_table *wait)
+ {
+-	struct mctp_lpc *priv = to_mctp_lpc(filp);
++	struct mctp_lpc *priv;
++	struct device *dev;
++	unsigned int val;
  	bool ibf;
  
++	priv = to_mctp_lpc(filp);
++	dev = priv->miscdev.this_device;
++
++	regmap_read(priv->map, LPC_STR4, &val);
++
  	spin_lock_irq(&priv->rx.lock);
 -	ibf = priv->str & STR4_IBF;
-+	ibf = priv->pending;
- 	spin_unlock_irq(&priv->rx.lock);
+-	spin_unlock_irq(&priv->rx.lock);
  
- 	if (ibf)
-@@ -241,7 +249,7 @@ static __poll_t mctp_lpc_poll(struct file *filp, poll_table *wait)
- 		return -EINTR;
+-	if (ibf)
+-		return EPOLLIN;
++	ibf = priv->pending || val & STR4_IBF;
  
- 	spin_lock_irq(&priv->rx.lock);
+-	poll_wait(filp, &priv->rx, wait);
++	if (!ibf) {
++		dev_dbg(dev, "Polling on IBF\n");
+ 
+-	if (signal_pending(current))
+-		return -EINTR;
++		spin_unlock_irq(&priv->rx.lock);
++
++		poll_wait(filp, &priv->rx, wait);
++		if (signal_pending(current)) {
++			dev_dbg(dev, "Polling IBF was interrupted\n");
++			goto out;
++		}
++
++		regmap_read(priv->map, LPC_STR4, &val);
++
++		spin_lock_irq(&priv->rx.lock);
++
++		ibf = priv->pending || val & STR4_IBF;
++	}
+ 
+-	spin_lock_irq(&priv->rx.lock);
 -	ibf = priv->str & STR4_IBF;
-+	ibf = priv->pending;
  	spin_unlock_irq(&priv->rx.lock);
  
++out:
++	dev_dbg(dev, "Polled IBF state: %s\n", ibf ? "set" : "clear");
++
  	return ibf ? EPOLLIN : 0;
+ }
+ 
 -- 
 2.20.1
 

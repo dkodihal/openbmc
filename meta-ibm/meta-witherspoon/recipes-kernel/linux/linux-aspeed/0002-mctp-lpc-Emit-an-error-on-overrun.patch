@@ -1,7 +1,7 @@
 From 80a74914aeb2b85ae330b04b09982a687c0775f3 Mon Sep 17 00:00:00 2001
 From: Andrew Jeffery <andrew@aj.id.au>
 Date: Fri, 10 May 2019 10:46:47 +0930
-Subject: [PATCH 2/2] mctp-lpc: Emit an error on overrun
+Subject: [PATCH 2/3] mctp-lpc: Emit an error on overrun
 
 Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
 ---

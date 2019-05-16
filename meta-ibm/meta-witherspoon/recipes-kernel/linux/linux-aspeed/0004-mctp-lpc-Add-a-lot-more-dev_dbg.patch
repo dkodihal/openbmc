@@ -1,0 +1,165 @@
+From 0454cce2dc2752ee3f0906dcfd989b977e4a5720 Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@aj.id.au>
+Date: Wed, 15 May 2019 11:12:55 +0930
+Subject: [PATCH 4/4] mctp-lpc: Add a lot more dev_dbg()
+
+Signed-off-by: Andrew Jeffery <andrew@aj.id.au>
+---
+ drivers/misc/mctp-lpc.c | 42 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/misc/mctp-lpc.c b/drivers/misc/mctp-lpc.c
+index cf2ee0d2a62c..ccfef466feac 100644
+--- a/drivers/misc/mctp-lpc.c
++++ b/drivers/misc/mctp-lpc.c
+@@ -59,9 +59,12 @@ static irqreturn_t mctp_lpc_irq(int irq, void *data)
+ 	struct mctp_lpc *priv = data;
+ 	unsigned long flags;
+ 	unsigned int hicrb;
++	struct device *dev;
+ 	unsigned int str;
+ 	irqreturn_t ret;
+ 
++	dev = priv->miscdev.this_device;
++
+ 	spin_lock_irqsave(&priv->rx.lock, flags);
+ 
+ 	regmap_read(priv->map, LPC_STR4, &str);
+@@ -69,14 +72,20 @@ static irqreturn_t mctp_lpc_irq(int irq, void *data)
+ 
+ 	if ((str & STR4_IBF) && (hicrb & LPC_HICRB_IBFIF4)) {
+ 		if (priv->pending)
+-			dev_err(priv->miscdev.this_device, "Storm brewing!");
++			dev_err(dev, "Storm brewing!");
++		dev_dbg(dev, "Received IRQ %d, masking to provide back-pressure\n",
++			irq);
+ 		/* Mask the IRQ / Enter polling mode */
+ 		regmap_update_bits(priv->map, LPC_HICRB, LPC_HICRB_IBFIF4, 0);
+ 		priv->pending = true;
++		dev_dbg(dev, "Set pending, waking waiters\n");
+ 		wake_up_locked(&priv->rx);
+ 		ret = IRQ_HANDLED;
+-	} else
++	} else {
++		dev_dbg(dev, "LPC IRQ triggered, but not for us (str=0x%x, hicrb=0x%x)\n",
++			str, hicrb);
+ 		ret = IRQ_NONE;
++	}
+ 
+ 	spin_unlock_irqrestore(&priv->rx.lock, flags);
+ 
+@@ -91,10 +100,14 @@ static inline struct mctp_lpc *to_mctp_lpc(struct file *filp)
+ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+ 			     size_t count, loff_t *ppos)
+ {
+-	struct mctp_lpc *priv = to_mctp_lpc(filp);
++	struct mctp_lpc *priv;
++	struct device *dev;
+ 	size_t remaining;
+ 	ssize_t rc;
+ 
++	priv = to_mctp_lpc(filp);
++	dev = priv->miscdev.this_device;
++
+ 	if (!count)
+ 		return 0;
+ 
+@@ -109,20 +122,24 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+ 		u8 idr;
+ 
+ 		/* YOLO blocking, non-block not supported */
++		dev_dbg(dev, "Waiting for IBF\n");
+ 		rc = wait_event_interruptible_locked(priv->rx, priv->pending);
+ 		if (rc < 0)
+ 			goto out;
+ 
+ 		if (signal_pending(current)) {
++			dev_dbg(dev, "Interrupted waiting for IBF\n");
+ 			rc = -EINTR;
+ 			goto out;
+ 		}
+ 
++		dev_dbg(dev, "Woken by IBF IRQ, consuming IDR\n");
+ 		regmap_read(priv->map, LPC_IDR4, &val);
+ 		idr = val & 0xff;
+ 
+ 		priv->pending = false;
+ 		/* Re-enable IRQs */
++		dev_dbg(dev, "Consumed IDR, unmasking IRQ\n");
+ 		regmap_update_bits(priv->map, LPC_HICRB, LPC_HICRB_IBFIF4,
+ 				   LPC_HICRB_IBFIF4);
+ 
+@@ -147,6 +164,7 @@ static ssize_t mctp_lpc_read(struct file *filp, char __user *buf,
+ 		regmap_read(priv->map, LPC_STR4, &val);
+ 		str = val & 0xff;
+ 
++		dev_dbg(dev, "Read status 0x%x\n", str);
+ 		if (copy_to_user(buf, &str, sizeof(str))) {
+ 			rc = -EFAULT;
+ 			goto out;
+@@ -196,6 +214,7 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 
+ 	if (*ppos == 0) {
+ 		/* Wait until OBF is clear - we don't get an IRQ */
++		dev_dbg(dev, "Waiting for OBF to clear\n");
+ 		for (;;) {
+ 			if (signal_pending(current))
+ 				return -EINTR;
+@@ -207,6 +226,7 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 			msleep(1);
+ 		}
+ 
++		dev_dbg(dev, "Writing 0x%x to ODR\n", *data);
+ 		regmap_write(priv->map, LPC_ODR4, *data);
+ 		remaining--;
+ 		data++;
+@@ -223,7 +243,7 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 	WARN_ON(remaining);
+ 
+ 	regmap_read(priv->map, LPC_STR4, &str);
+-	dev_dbg(dev, "Triggering SerIRQ. STR: 0x%x\n", str);
++	dev_dbg(dev, "Triggering SerIRQ (current str=0x%x)\n", str);
+ 	/* Trigger Host IRQ */
+ 	regmap_update_bits(priv->map, LPC_HICRC, LPC_KCS4_IRQ_HOST,
+ 			   LPC_KCS4_IRQ_HOST);
+@@ -233,25 +253,35 @@ static ssize_t mctp_lpc_write(struct file *filp, const char __user *buf,
+ 
+ static __poll_t mctp_lpc_poll(struct file *filp, poll_table *wait)
+ {
+-	struct mctp_lpc *priv = to_mctp_lpc(filp);
++	struct mctp_lpc *priv;
++	struct device *dev;
+ 	bool ibf;
+ 
++	priv = to_mctp_lpc(filp);
++	dev = priv->miscdev.this_device;
++
+ 	spin_lock_irq(&priv->rx.lock);
+ 	ibf = priv->pending;
+ 	spin_unlock_irq(&priv->rx.lock);
+ 
++	dev_dbg(dev, "Current IBF state: %s\n", ibf ? "set" : "clear");
+ 	if (ibf)
+ 		return EPOLLIN;
+ 
++	dev_dbg(dev, "Polling on IBF\n");
+ 	poll_wait(filp, &priv->rx, wait);
+ 
+-	if (signal_pending(current))
++	if (signal_pending(current)) {
++		dev_dbg(dev, "Polling IBF was interrupted\n");
+ 		return -EINTR;
++	}
+ 
+ 	spin_lock_irq(&priv->rx.lock);
+ 	ibf = priv->pending;
+ 	spin_unlock_irq(&priv->rx.lock);
+ 
++	dev_dbg(dev, "Polled IBF state: %s\n", ibf ? "set" : "clear");
++
+ 	return ibf ? EPOLLIN : 0;
+ }
+ 
+-- 
+2.20.1
+

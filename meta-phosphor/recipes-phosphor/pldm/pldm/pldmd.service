@@ -1,0 +1,10 @@
+[Unit]
+Description=Phosphor PLDM Daemon
+
+[Service]
+Restart=always
+ExecStart=/usr/bin/env pldmd
+SyslogIdentifier=pldmd
+
+[Install]
+WantedBy={SYSTEMD_DEFAULT_TARGET}

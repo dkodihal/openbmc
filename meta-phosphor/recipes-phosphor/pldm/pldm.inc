@@ -1,0 +1,7 @@
+HOMEPAGE = "https://github.com/dkodihal/pldm/tree/dev/astlpc"
+LICENSE = "Apache-2.0"
+LIC_FILES_CHKSUM = "file://LICENSE;md5=86d3f3a95c324c9479bd8986968f4327"
+#SRC_URI = "git:///esw/san5/dkodihal/obmc/dkodihal/pldm;branch=dev/astlpc"
+#SRCREV = "4ed1d1365d1def4c4f4e7704b81730875c237bb8"
+SRC_URI = "git://github.com/dkodihal/pldm;branch=dev/astlpc"
+SRCREV = "4ed1d1365d1def4c4f4e7704b81730875c237bb8"
